@@ -46,7 +46,7 @@ def norm_L2(v: ufl.core.expr.Expr, measure: ufl.Measure = ufl.dx) -> np.inexact:
 
 
 # Compute of cell vs. facets
-def compute_cell_boundary_facets(msh):
+def compute_cell_boundary_facets(msh : dolfinx.mesh.Mesh) -> np.inexact:
     """
     Compute the integration entities for integrals around the
     boundaries of all cells in msh.
@@ -82,28 +82,32 @@ rank = comm.rank            # Number of processors
 dtype = PETSc.ScalarType    # Scalar type
 
 # %% 3. Loading of mesh of interest
-# Current testing of original mesh creations and definitions of
-# integrated testing meshes.
-# Moved from:
-msh, markers, facets = io.gmsh.read_from_msh("./include/gmsh/cubeD0.msh", MPI.COMM_WORLD)[:3]
-# To:
-# n = 8  # Number of elements in each direction
-# msh = mesh.create_unit_cube(comm, n, n, n, ghost_mode=mesh.GhostMode.none)
+# Loading a gmsh mesh, it's important to remember that the mesh loads
+# the identities:
+# - msh : Mesh identity of dolfinx.
+# - markers : Cell markers from gmsh.
+# - facets : Facet markers from gmsh.
+msh, markers, facets = io.gmsh.read_from_msh(
+    "./include/gmsh/cubeD0.msh", comm)[:3]
 
 # Dimentionality of the interpolants
-tdim = msh.topology.dim
-fdim = tdim - 1
+tdim = msh.topology.dim     # volume variables dimention
+fdim = tdim - 1             # surface variables dimention
 
-# Definition of facets over generated mesh
+# Definition of facets over generated mesh:
+# Here we define the identities of the faces to be able to modify
+# and create function spaces over the faces.
 msh.topology.create_entities(fdim)
-facet_imap = msh.topology.index_map(fdim)
-num_facets = facet_imap.size_local + facet_imap.num_ghosts
-facets = np.arange(num_facets, dtype=np.int32)
+
+facet_imap = msh.topology.index_map(fdim)                   # Faces mapping
+num_facets = facet_imap.size_local + facet_imap.num_ghosts  # #Faces + #Non-tagged faces
+facets     = np.arange(num_facets, dtype=np.int32)          # Sort of faces (ascending)
 
 # Generation of face mesh (skeleton)
-# - Due to the use of dual spaces mesh vs. skeleton
-#   it's needed to define a mesh containing just the
-#   faces of the original mesh
+# Here it's important to notice that we recieve a `facet_mesh_emap` this is the mapping
+# from the msh faces onto the face_mesh entities.
+# - Due to the use of dual spaces mesh vs. skeleton it's needed to define a mesh
+#   containing just the faces of the original mesh
 facet_mesh, facet_mesh_emap = mesh.create_submesh(msh, fdim, facets)[:2]
 
 entity_maps = [facet_mesh_emap]     # Listing of facet mesh to mesh
@@ -112,11 +116,15 @@ entity_maps = [facet_mesh_emap]     # Listing of facet mesh to mesh
 k = 1  # Polynomial order
 
 # Definition of function spaces
+# It's important to remark that here we define DISCONTINUOUS polynomial spaces,
+# just by this the Dolphinx framework knows we're working on a DG method.
 V    = fem.functionspace(       msh, ("Discontinuous Lagrange", k))
 Vbar = fem.functionspace(facet_mesh, ("Discontinuous Lagrange", k))
 
 # Coupling of function spaces V & Vbar (Volume & Skeleton)
-W = ufl.MixedFunctionSpace(V, Vbar)
+# By this coupling we're now remarking that the approximation in the space V is
+# related to the approximation in the space Vbar through the facet mesh.
+W = ufl.MixedFunctionSpace(V, Vbar)     # Definition of space W = V \times \bar{V}
 
 # Definition of approximation and test functions
 u, ubar = ufl.TrialFunctions(W)
@@ -128,7 +136,7 @@ dx_c = ufl.Measure("dx", domain=msh)  # Cell measure
 # We're now defining a measure to integrate around the boundary
 # of each cell
 cell_boundary_facets = compute_cell_boundary_facets(msh)
-cell_boundaries = 1  # Different tag from BC or Innerfaces
+cell_boundaries = 1                                         # Tag to denote \partial K (msh)
 
 # Definition of measure over the boundary of each cell
 ds_c = ufl.Measure(
@@ -185,21 +193,25 @@ bc = fem.dirichletbc(dtype(0.0), dofs, Vbar)
 
 # %% 8. Assembly of the final system
 # Assemble of bilinear with boundary conditions
-A = assemble_matrix(a_blocked, bcs=[bc])
-A.assemble()
+A = assemble_matrix(a_blocked, bcs=[bc])    # Here the matrix A is formed by the blocks of a
+A.assemble()                                # And we compile the matrix.
 
 # Assemble of RHS with existing conditions
-b = assemble_vector(L_blocked)
-bcs1 = fem.bcs_by_block(fem.extract_function_spaces(a_blocked, 1), [bc])
+b = assemble_vector(L_blocked)                  # RHS vector assembled from L_blocked
+bcs1 = fem.bcs_by_block(
+    extract_function_spaces(a_blocked, 1),      # Boundary conditions assembled by blocks
+    [bc])
 
 # Lifting of solution into the \Gamma Dirichlet
-apply_lifting(b, a_blocked, bcs=bcs1)
+apply_lifting(b, a_blocked, bcs=bcs1)           # Lifting of block matrixes
 
 # Update of RHS according to the lifting
-b.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
+b.ghostUpdate(addv=PETSc.InsertMode.ADD,        # Update of values after lifting
+              mode=PETSc.ScatterMode.REVERSE)
 
-# Boundary conditions extracted after lifting \Gamma_{DC} -> \Gamma_0
-bcs0 = fem.bcs_by_block(extract_function_spaces(L_blocked), [bc])
+# Boundary conditions extracted after lifting \Gamma_{BC} -> \Gamma_0
+bcs0 = fem.bcs_by_block(
+    extract_function_spaces(L_blocked), [bc])
 set_bc(b, bcs0)
 
 # %% 9. Construction of Solver
